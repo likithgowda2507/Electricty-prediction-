@@ -25,6 +25,8 @@ BASE_FEATURES = [
     # Building
     'Building_ID_Encoded',
     'Building_Area_sqft', 'Number_of_Occupants',
+    # Summer-specific (HIGH IMPACT on summer bills)
+    'Is_Summer', 'Summer_Demand_Boost', 'Summer_Temp_Bill_Factor',
     # Weather
     'Temperature_Avg', 'Humidity', 'Rainfall_mm', 'Wind_Speed',
     'Cooling_Degree_Days', 'Heating_Degree_Days',
@@ -93,14 +95,20 @@ def load_and_prepare(test_size=0.2, random_state=42):
         df['Month_Cos'] = np.cos(2 * np.pi * df['Month'] / 12)
 
     # ---- Create Temperature-Based Features ----
-    # Higher temperature → more cooling → higher consumption and cost
     temp_mean = df['Temperature_Avg'].mean()
     df['Temperature_Anomaly'] = df['Temperature_Avg'] - temp_mean
     df['Temp_AC_Interaction'] = df['Temperature_Avg'] * df['AC_Usage_Hours']
     df['Temp_Peak_Load_Interaction'] = df['Temperature_Avg'] * df['Peak_Load_kW']
     df['Temp_Multiplier'] = 1 + (df['Temperature_Avg'] - 30) / 10
     df['Temp_Multiplier'] = df['Temp_Multiplier'].clip(lower=0.8)
-    print(f"  Created temperature-based features to capture temp → consumption relationship")
+    print("  Created temperature-based features to capture temperature -> consumption relationship")
+
+    # ---- Create Summer-Specific Features ----
+    # April (4), May (5), June (6) are summer months in India with high AC usage
+    df['Is_Summer'] = df['Month'].isin([4, 5, 6]).astype(int)
+    df['Summer_Demand_Boost'] = df['Is_Summer'] * df['Maximum_Demand_kW'] * 0.5  # 50% boost in peak demand
+    df['Summer_Temp_Bill_Factor'] = df['Is_Summer'] * (df['Temperature_Avg'] - 30) * df['Maximum_Demand_kW']  # Temp * Demand in summer
+    print("  Created summer-specific features (Is_Summer, Summer_Demand_Boost, Summer_Temp_Bill_Factor)")
 
     # ---- Handle Missing Values ----
     # Fill numeric NaN with column median

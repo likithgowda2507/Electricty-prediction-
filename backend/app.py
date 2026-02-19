@@ -10,6 +10,9 @@ import sys
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(BASE_DIR, "../src"))
 
+# Define MODEL_DIR first
+MODEL_DIR = os.path.join(BASE_DIR, "..")
+
 try:
     from data_prep_unified import FEATURES, load_and_prepare
     print(f"[OK] Imported FEATURES from data_prep_unified: {len(FEATURES) if FEATURES else 0} features")
@@ -19,7 +22,6 @@ except ImportError as e:
 
 # Also try to load from model_features.json to ensure consistency with trained model
 try:
-    import json
     with open(os.path.join(MODEL_DIR, "model_features.json")) as f:
         model_features_data = json.load(f)
         if isinstance(model_features_data, dict):
@@ -171,6 +173,20 @@ def build_input_row(building_id, year, month, temp=None, humidity=None, rainfall
                 row[feat] = int(building_encoder.transform([building_id])[0])
             else:
                 row[feat] = 0
+        elif feat == 'Is_Summer':
+            # Summer is April-June (months 4, 5, 6)
+            row[feat] = 1 if month in [4, 5, 6] else 0
+        elif feat == 'Summer_Demand_Boost':
+            # 50% boost to peak demand during summer
+            is_summer = 1 if month in [4, 5, 6] else 0
+            peak_demand = float(baseline['Maximum_Demand_kW'].median()) if 'Maximum_Demand_kW' in baseline.columns else 50
+            row[feat] = is_summer * peak_demand * 0.5
+        elif feat == 'Summer_Temp_Bill_Factor':
+            # Temperature × Demand interaction specifically in summer
+            is_summer = 1 if month in [4, 5, 6] else 0
+            temp_val = temp if temp is not None else 25
+            peak_demand = float(baseline['Maximum_Demand_kW'].median()) if 'Maximum_Demand_kW' in baseline.columns else 50
+            row[feat] = is_summer * (temp_val - 30) * peak_demand
         else:
             # Use median of historical data for this building+month
             if feat in baseline.columns:
@@ -403,14 +419,28 @@ def yearly_forecast():
                 continue
 
             energy_pred = float(energy_model.predict(X_input)[0])
-            bill_pred = float(bill_model.predict(X_input)[0])
+            
+            # Get tariff and demand charge information for this month
+            mask = (df['Building_ID'] == building_id) & (df['Month'] == month)
+            tariff = float(df[mask]['Tariff_per_kWh'].mean()) if not df[mask].empty else 7.0
+            demand_charge = float(df[mask]['Demand_Charge_per_kW'].mean()) if not df[mask].empty else 50.0
+            fixed_charge = float(df[mask]['Fixed_Charge'].mean()) if not df[mask].empty else 500.0
+            
+            # Get predicted peak demand (higher in summer due to AC load)
+            baseline = df[mask] if not df[mask].empty else df[df['Building_ID'] == building_id]
+            peak_demand = float(baseline['Maximum_Demand_kW'].median()) if 'Maximum_Demand_kW' in baseline.columns else 100
+            
+            # SUMMER ADJUSTMENT: Peak demand increases by 50% in summer months (Apr-Jun)
+            if month in [4, 5, 6]:  # April, May, June
+                peak_demand = peak_demand * 1.5  # 50% increase in summer
+                demand_charge = demand_charge * 1.2  # 20% higher demand charges in summer
+            
+            # Calculate final bill using tariff structure:
+            # Total Bill = (Energy × Tariff) + (Peak Demand × Demand Charge) + Fixed Charge
+            bill_pred = (energy_pred * tariff) + (peak_demand * demand_charge) + fixed_charge
 
             # Previous year baseline
             prev_energy, prev_bill = get_baseline_usage(building_id, month)
-
-            # Tariff rate from historical data
-            mask = (df['Building_ID'] == building_id) & (df['Month'] == month)
-            tariff = float(df[mask]['Tariff_per_kWh'].mean()) if not df[mask].empty else 7.0
 
             results.append({
                 'month': month,
@@ -419,7 +449,9 @@ def yearly_forecast():
                 'prev_energy': round(prev_energy, 2),
                 'prev_bill': round(prev_bill, 2),
                 'temp': round(temp, 1),
-                'tariff_rate': round(tariff, 2)
+                'tariff_rate': round(tariff, 2),
+                'peak_demand': round(peak_demand, 1),
+                'demand_charge': round(demand_charge, 2)
             })
         except Exception as e:
             print(f"Error month {month}: {e}")
