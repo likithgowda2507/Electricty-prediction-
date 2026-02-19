@@ -419,25 +419,11 @@ def yearly_forecast():
                 continue
 
             energy_pred = float(energy_model.predict(X_input)[0])
+            bill_pred = float(bill_model.predict(X_input)[0])
             
-            # Get tariff and demand charge information for this month
+            # Get tariff info for display
             mask = (df['Building_ID'] == building_id) & (df['Month'] == month)
             tariff = float(df[mask]['Tariff_per_kWh'].mean()) if not df[mask].empty else 7.0
-            demand_charge = float(df[mask]['Demand_Charge_per_kW'].mean()) if not df[mask].empty else 50.0
-            fixed_charge = float(df[mask]['Fixed_Charge'].mean()) if not df[mask].empty else 500.0
-            
-            # Get predicted peak demand (higher in summer due to AC load)
-            baseline = df[mask] if not df[mask].empty else df[df['Building_ID'] == building_id]
-            peak_demand = float(baseline['Maximum_Demand_kW'].median()) if 'Maximum_Demand_kW' in baseline.columns else 100
-            
-            # SUMMER ADJUSTMENT: Peak demand increases by 50% in summer months (Apr-Jun)
-            if month in [4, 5, 6]:  # April, May, June
-                peak_demand = peak_demand * 1.5  # 50% increase in summer
-                demand_charge = demand_charge * 1.2  # 20% higher demand charges in summer
-            
-            # Calculate final bill using tariff structure:
-            # Total Bill = (Energy × Tariff) + (Peak Demand × Demand Charge) + Fixed Charge
-            bill_pred = (energy_pred * tariff) + (peak_demand * demand_charge) + fixed_charge
 
             # Previous year baseline
             prev_energy, prev_bill = get_baseline_usage(building_id, month)
@@ -449,9 +435,7 @@ def yearly_forecast():
                 'prev_energy': round(prev_energy, 2),
                 'prev_bill': round(prev_bill, 2),
                 'temp': round(temp, 1),
-                'tariff_rate': round(tariff, 2),
-                'peak_demand': round(peak_demand, 1),
-                'demand_charge': round(demand_charge, 2)
+                'tariff_rate': round(tariff, 2)
             })
         except Exception as e:
             print(f"Error month {month}: {e}")
@@ -519,40 +503,262 @@ def business_qa():
 
     factors = []
 
+    # === PRIMARY FACTOR: Year-over-Year Bill/Energy Trend ===
+    # Thresholds match the verdict (±5%) so they never contradict
+    energy_change_pct = 0
+    if actual_energy_a > 0:
+        energy_change_pct = ((pred_energy_b - actual_energy_a) / actual_energy_a) * 100
+
+    if pct_change > 5:
+        factors.append({
+            'factor': 'Year-over-Year Bill Increase',
+            'detail': f'Predicted bill ₹{pred_bill_b:,.0f} vs {year_a} actual ₹{actual_bill_a:,.0f} — up {pct_change:+.1f}% | Energy {energy_change_pct:+.1f}%',
+            'impact': 'negative'
+        })
+    elif pct_change < -5:
+        factors.append({
+            'factor': 'Year-over-Year Bill Decrease',
+            'detail': f'Predicted bill ₹{pred_bill_b:,.0f} vs {year_a} actual ₹{actual_bill_a:,.0f} — down {pct_change:+.1f}% | Energy {energy_change_pct:+.1f}%',
+            'impact': 'positive'
+        })
+    else:
+        factors.append({
+            'factor': 'Stable Year-over-Year Bill',
+            'detail': f'Predicted bill ₹{pred_bill_b:,.0f} vs {year_a} actual ₹{actual_bill_a:,.0f} — change {pct_change:+.1f}%',
+            'impact': 'neutral'
+        })
+
+    # === Historical Consumption Momentum ===
+    mask_bm = (df['Building_ID'] == building_id) & (df['Month'] == month)
+    bm_data = df[mask_bm]
+    overall_bld = df[df['Building_ID'] == building_id]
+
+    if not bm_data.empty:
+        # Check if consumption has been rising year-over-year
+        yearly_energy = df[(df['Building_ID'] == building_id) & (df['Month'] == month)].groupby('Year')['Energy_Consumption_kWh'].mean()
+        if len(yearly_energy) >= 2:
+            sorted_years = yearly_energy.sort_index()
+            recent_val = float(sorted_years.iloc[-1])
+            older_val = float(sorted_years.iloc[-2])
+            if older_val > 0:
+                hist_growth = ((recent_val - older_val) / older_val) * 100
+                if hist_growth > 3:
+                    factors.append({
+                        'factor': 'Rising Consumption Trend',
+                        'detail': f'Energy grew {hist_growth:+.1f}% between {int(sorted_years.index[-2])}–{int(sorted_years.index[-1])} for this month',
+                        'impact': 'negative'
+                    })
+                elif hist_growth < -3:
+                    factors.append({
+                        'factor': 'Declining Consumption Trend',
+                        'detail': f'Energy fell {hist_growth:+.1f}% between {int(sorted_years.index[-2])}–{int(sorted_years.index[-1])} for this month',
+                        'impact': 'positive'
+                    })
+
+    # === Lag Consumption / Rolling Average ===
+    if not bm_data.empty and 'Lag_1_Month_Consumption' in df.columns:
+        lag1 = float(bm_data['Lag_1_Month_Consumption'].mean())
+        avg_consumption = float(overall_bld['Energy_Consumption_kWh'].mean())
+        if avg_consumption > 0:
+            lag_pct = ((lag1 - avg_consumption) / avg_consumption) * 100
+            if lag_pct > 10:
+                factors.append({
+                    'factor': 'High Previous-Month Consumption',
+                    'detail': f'Prior month consumption {lag1:.0f} kWh vs building avg {avg_consumption:.0f} kWh — momentum carries forward',
+                    'impact': 'negative'
+                })
+            elif lag_pct < -10:
+                factors.append({
+                    'factor': 'Low Previous-Month Consumption',
+                    'detail': f'Prior month consumption {lag1:.0f} kWh vs building avg {avg_consumption:.0f} kWh — lower baseline',
+                    'impact': 'positive'
+                })
+
+    # === Peak Load / Maximum Demand ===
+    if not bm_data.empty and 'Peak_Load_kW' in df.columns:
+        peak_month = float(bm_data['Peak_Load_kW'].mean())
+        peak_overall = float(overall_bld['Peak_Load_kW'].mean())
+        if peak_overall > 0:
+            peak_pct = ((peak_month - peak_overall) / peak_overall) * 100
+            if peak_pct > 10:
+                factors.append({
+                    'factor': 'High Peak Load',
+                    'detail': f'Peak demand {peak_month:.1f} kW vs avg {peak_overall:.1f} kW — demand charges increase bill',
+                    'impact': 'negative'
+                })
+            elif peak_pct < -10:
+                factors.append({
+                    'factor': 'Low Peak Load',
+                    'detail': f'Peak demand {peak_month:.1f} kW vs avg {peak_overall:.1f} kW — lower demand charges',
+                    'impact': 'positive'
+                })
+
+    # === Temperature ===
     if temp_b > 30:
         factors.append({
             'factor': 'High Temperature',
-            'detail': f'Expected {temp_b:.1f}C increases cooling demand',
+            'detail': f'Expected {temp_b:.1f}°C increases cooling demand',
             'impact': 'negative'
         })
     elif temp_b < 20:
         factors.append({
             'factor': 'Low Temperature',
-            'detail': f'Expected {temp_b:.1f}C reduces cooling needs',
+            'detail': f'Expected {temp_b:.1f}°C reduces cooling needs',
             'impact': 'positive'
         })
 
-    if rainfall_b > 100:
-        factors.append({
-            'factor': 'High Rainfall',
-            'detail': f'{rainfall_b:.0f}mm expected -- humidity increases load',
-            'impact': 'negative'
-        })
+    # === Tariff ===
+    avg_tariff = float(df[mask_bm]['Tariff_per_kWh'].mean()) if not df[mask_bm].empty else 7.0
+    overall_tariff = float(overall_bld['Tariff_per_kWh'].mean())
+    if overall_tariff > 0:
+        tariff_diff = ((avg_tariff - overall_tariff) / overall_tariff) * 100
+        if tariff_diff > 2:
+            factors.append({
+                'factor': 'Higher Tariff Rate',
+                'detail': f'₹{avg_tariff:.2f}/kWh vs annual avg ₹{overall_tariff:.2f}/kWh — cost per unit is higher',
+                'impact': 'negative'
+            })
+        elif tariff_diff < -2:
+            factors.append({
+                'factor': 'Lower Tariff Rate',
+                'detail': f'₹{avg_tariff:.2f}/kWh vs annual avg ₹{overall_tariff:.2f}/kWh — cost per unit is lower',
+                'impact': 'positive'
+            })
 
-    # Tariff factor
-    mask_tariff = (df['Building_ID'] == building_id) & (df['Month'] == month)
-    avg_tariff = float(df[mask_tariff]['Tariff_per_kWh'].mean()) if not df[mask_tariff].empty else 7.0
-    if avg_tariff > 8:
-        factors.append({
-            'factor': 'High Tariff',
-            'detail': f'Avg tariff Rs.{avg_tariff:.2f}/kWh',
-            'impact': 'negative'
-        })
+    # === Equipment Efficiency ===
+    if not bm_data.empty and 'Equipment_Utilization_Percent' in df.columns:
+        equip_month = float(bm_data['Equipment_Utilization_Percent'].mean())
+        equip_overall = float(overall_bld['Equipment_Utilization_Percent'].mean())
 
-    if not factors:
+        if equip_month > equip_overall * 1.15:
+            factors.append({
+                'factor': 'High Equipment Utilization',
+                'detail': f'Equipment at {equip_month:.1f}% vs avg {equip_overall:.1f}% — heavier machinery load',
+                'impact': 'negative'
+            })
+        elif equip_month < equip_overall * 0.85:
+            factors.append({
+                'factor': 'Low Equipment Utilization',
+                'detail': f'Equipment at {equip_month:.1f}% vs avg {equip_overall:.1f}% — lighter load saves energy',
+                'impact': 'positive'
+            })
+
+    # === Building Occupancy ===
+    if not bm_data.empty and 'Occupancy_Rate' in df.columns:
+        occ_month = float(bm_data['Occupancy_Rate'].mean())
+        occ_overall = float(overall_bld['Occupancy_Rate'].mean())
+
+        if occ_month > occ_overall * 1.1:
+            factors.append({
+                'factor': 'Higher Occupancy',
+                'detail': f'Occupancy at {occ_month:.1f}% vs avg {occ_overall:.1f}% — more people = more energy',
+                'impact': 'negative'
+            })
+        elif occ_month < occ_overall * 0.9:
+            factors.append({
+                'factor': 'Lower Occupancy',
+                'detail': f'Occupancy at {occ_month:.1f}% vs avg {occ_overall:.1f}% — fewer occupants save energy',
+                'impact': 'positive'
+            })
+
+    # === Seasonal Variation ===
+    season_map = {1: 'Winter', 2: 'Winter', 3: 'Summer', 4: 'Summer',
+                  5: 'Summer', 6: 'Monsoon', 7: 'Monsoon', 8: 'Monsoon',
+                  9: 'Monsoon', 10: 'Winter', 11: 'Winter', 12: 'Winter'}
+    current_season = season_map.get(month, 'Winter')
+
+    if 'Season' in df.columns:
+        seasonal_avg = df[df['Building_ID'] == building_id].groupby('Season')['Energy_Consumption_kWh'].mean()
+        overall_energy_avg = float(overall_bld['Energy_Consumption_kWh'].mean())
+
+        if current_season in seasonal_avg.index:
+            season_energy = float(seasonal_avg[current_season])
+            pct_diff_season = ((season_energy - overall_energy_avg) / overall_energy_avg) * 100 if overall_energy_avg > 0 else 0
+
+            if current_season == 'Summer':
+                factors.append({
+                    'factor': 'Summer Season Effect',
+                    'detail': f'Summer months see {pct_diff_season:+.1f}% energy vs yearly avg — cooling demand peaks',
+                    'impact': 'negative' if pct_diff_season > 5 else 'neutral'
+                })
+            elif current_season == 'Monsoon':
+                factors.append({
+                    'factor': 'Monsoon Season Effect',
+                    'detail': f'Monsoon months see {pct_diff_season:+.1f}% energy vs yearly avg — humidity drives HVAC load',
+                    'impact': 'negative' if pct_diff_season > 5 else 'neutral'
+                })
+            elif current_season == 'Winter':
+                factors.append({
+                    'factor': 'Winter Season Effect',
+                    'detail': f'Winter months see {pct_diff_season:+.1f}% energy vs yearly avg — lower cooling needs',
+                    'impact': 'positive' if pct_diff_season < -5 else 'neutral'
+                })
+
+    # === Weather (Humidity, CDD, Heat Index) ===
+    if not bm_data.empty:
+        if 'Humidity' in df.columns:
+            humidity_month = float(bm_data['Humidity'].mean())
+            if humidity_month > 75:
+                factors.append({
+                    'factor': 'High Humidity',
+                    'detail': f'Humidity at {humidity_month:.0f}% — HVAC works harder for dehumidification',
+                    'impact': 'negative'
+                })
+
+        if 'Cooling_Degree_Days' in df.columns:
+            cdd_month = float(bm_data['Cooling_Degree_Days'].mean())
+            cdd_overall = float(overall_bld['Cooling_Degree_Days'].mean())
+            if cdd_month > cdd_overall * 1.3 and cdd_month > 3:
+                factors.append({
+                    'factor': 'High Cooling Demand',
+                    'detail': f'Cooling degree days {cdd_month:.1f} vs avg {cdd_overall:.1f} — significant cooling energy required',
+                    'impact': 'negative'
+                })
+
+        if 'Heat_Index' in df.columns:
+            heat_idx = float(bm_data['Heat_Index'].mean())
+            if heat_idx > 35:
+                factors.append({
+                    'factor': 'Extreme Heat Index',
+                    'detail': f'Heat index of {heat_idx:.1f}°C — combined heat & humidity strain on cooling',
+                    'impact': 'negative'
+                })
+
+    # === FILTER: Only show factors that align with the prediction direction ===
+    # When bill is HIGHER → show negative factors (they explain the increase)
+    # When bill is LOWER  → show positive factors (they explain the decrease)
+    # Always keep the primary Year-over-Year factor and neutral factors
+    primary_keywords = ['Year-over-Year']
+
+    if verdict == 'HIGHER':
+        factors = [f for f in factors
+                   if f['impact'] in ('negative', 'neutral')
+                   or any(kw in f['factor'] for kw in primary_keywords)]
+    elif verdict == 'LOWER':
+        factors = [f for f in factors
+                   if f['impact'] in ('positive', 'neutral')
+                   or any(kw in f['factor'] for kw in primary_keywords)]
+
+    # Ensure we always have at least 2 factors for context
+    if len(factors) < 2:
+        # Add the energy trend as a supporting factor
+        if pred_energy_b > actual_energy_a:
+            factors.append({
+                'factor': 'Higher Energy Demand',
+                'detail': f'Predicted {pred_energy_b:.0f} kWh vs {year_a} actual {actual_energy_a:.0f} kWh — model expects increased usage',
+                'impact': 'negative'
+            })
+        elif pred_energy_b < actual_energy_a:
+            factors.append({
+                'factor': 'Lower Energy Demand',
+                'detail': f'Predicted {pred_energy_b:.0f} kWh vs {year_a} actual {actual_energy_a:.0f} kWh — model expects reduced usage',
+                'impact': 'positive'
+            })
+
+        # Add tariff context
         factors.append({
-            'factor': 'Stable Conditions',
-            'detail': 'No extreme weather or tariff changes expected',
+            'factor': 'Tariff & Demand Charges',
+            'detail': f'Avg tariff ₹{avg_tariff:.2f}/kWh combined with demand charges shape the final bill',
             'impact': 'neutral'
         })
 
@@ -572,6 +778,170 @@ def business_qa():
         'assumed_conditions': {
             'temp': round(temp_b, 1),
             'tariff': round(avg_tariff, 2)
+        }
+    })
+
+
+# ---- SOLAR ANALYSIS ----
+@app.route('/api/solar-analysis', methods=['POST'])
+def solar_analysis():
+    """Calculate monthly solar power generation potential and savings."""
+    if df is None:
+        return jsonify({'error': 'Dataset not loaded'}), 500
+
+    data = request.json
+    building_id = data.get('building_id', 'B1')
+    year = int(data.get('year', 2026))
+    panel_capacity_kw = float(data.get('panel_capacity_kw', 0))  # 0 = auto-calculate
+
+    # Building info
+    bld = df[df['Building_ID'] == building_id]
+    if bld.empty:
+        return jsonify({'error': 'Building not found'}), 404
+
+    building_area = float(bld['Building_Area_sqft'].mean())
+    building_type = str(bld['Building_Type'].iloc[0]) if 'Building_Type' in bld.columns else 'Office'
+
+    # Solar panel sizing: ~10% of building rooftop usable, 1 kW per 100 sqft
+    usable_roof_sqft = building_area * 0.30  # 30% rooftop available for panels
+    auto_capacity_kw = usable_roof_sqft / 100  # 1 kW per 100 sqft of panels
+
+    if panel_capacity_kw <= 0:
+        panel_capacity_kw = auto_capacity_kw
+
+    # Average Peak Sun Hours by month for India (typical values)
+    # Based on MNRE data for central/south India
+    peak_sun_hours = {
+        1: 5.0, 2: 5.5, 3: 6.0, 4: 6.5, 5: 6.8, 6: 5.5,
+        7: 4.5, 8: 4.5, 9: 5.0, 10: 5.5, 11: 5.0, 12: 4.8
+    }
+
+    # Days per month
+    days_in_month = {
+        1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30,
+        7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31
+    }
+
+    monthly_results = []
+    total_generation = 0
+    total_savings = 0
+    total_consumption = 0
+
+    for month in range(1, 13):
+        mask = (df['Building_ID'] == building_id) & (df['Month'] == month)
+        month_data = df[mask]
+
+        if month_data.empty:
+            continue
+
+        # Weather conditions for this month
+        cloud_cover = float(month_data['Cloud_Cover'].mean()) if 'Cloud_Cover' in df.columns else 50
+        temp_avg = float(month_data['Temperature_Avg'].mean())
+        humidity = float(month_data['Humidity'].mean()) if 'Humidity' in df.columns else 60
+        rainfall = float(month_data['Rainfall_mm'].mean()) if 'Rainfall_mm' in df.columns else 5
+
+        # Average consumption and bill for this building + month
+        avg_consumption = float(month_data['Energy_Consumption_kWh'].mean())
+        avg_bill = float(month_data['Electricity_Bill_Amount'].mean())
+        avg_tariff = float(month_data['Tariff_per_kWh'].mean()) if 'Tariff_per_kWh' in df.columns else 7.0
+
+        # Solar generation calculation
+        # 1. Cloud cover derating factor (0% cloud = 100% generation, 100% cloud = ~20%)
+        cloud_factor = 1.0 - (cloud_cover / 100.0) * 0.8
+
+        # 2. Temperature derating (-0.4% per degree above 25°C for silicon panels)
+        temp_factor = 1.0
+        if temp_avg > 25:
+            temp_factor = 1.0 - 0.004 * (temp_avg - 25)
+        temp_factor = max(temp_factor, 0.7)  # Floor at 70%
+
+        # 3. System efficiency (inverter, wiring, dust, degradation)
+        system_efficiency = 0.80
+
+        # 4. Daily generation = capacity × peak sun hours × cloud factor × temp factor × efficiency
+        daily_generation = panel_capacity_kw * peak_sun_hours[month] * cloud_factor * temp_factor * system_efficiency
+
+        # 5. Monthly generation
+        monthly_generation = daily_generation * days_in_month[month]
+
+        # 6. Actual usable solar (can't exceed consumption)
+        self_consumed = min(monthly_generation, avg_consumption)
+
+        # 7. Excess exported to grid (net metering at ~50% tariff)
+        excess = max(0, monthly_generation - avg_consumption)
+        export_credit = excess * avg_tariff * 0.5
+
+        # 8. Savings
+        direct_savings = self_consumed * avg_tariff
+        total_monthly_savings = direct_savings + export_credit
+
+        # Solar offset percentage
+        solar_offset_pct = (monthly_generation / avg_consumption * 100) if avg_consumption > 0 else 0
+
+        # CO2 savings (India grid emission factor: ~0.82 kg CO2/kWh)
+        co2_saved_kg = monthly_generation * 0.82
+
+        monthly_results.append({
+            'month': month,
+            'days': days_in_month[month],
+            'solar_generation_kwh': round(monthly_generation, 1),
+            'self_consumed_kwh': round(self_consumed, 1),
+            'excess_exported_kwh': round(excess, 1),
+            'avg_consumption_kwh': round(avg_consumption, 1),
+            'net_consumption_kwh': round(max(0, avg_consumption - self_consumed), 1),
+            'avg_bill': round(avg_bill, 0),
+            'direct_savings': round(direct_savings, 0),
+            'export_credit': round(export_credit, 0),
+            'total_savings': round(total_monthly_savings, 0),
+            'reduced_bill': round(avg_bill - total_monthly_savings, 0),
+            'solar_offset_pct': round(solar_offset_pct, 1),
+            'co2_saved_kg': round(co2_saved_kg, 1),
+            'cloud_cover': round(cloud_cover, 1),
+            'temp_avg': round(temp_avg, 1),
+            'peak_sun_hrs': peak_sun_hours[month]
+        })
+
+        total_generation += monthly_generation
+        total_savings += total_monthly_savings
+        total_consumption += avg_consumption
+
+    # Annual summary
+    total_original_bill = sum(r['avg_bill'] for r in monthly_results)
+    total_reduced_bill = sum(r['reduced_bill'] for r in monthly_results)
+    annual_co2_saved = sum(r['co2_saved_kg'] for r in monthly_results)
+
+    # ROI calculation
+    # Average cost of solar in India: Rs.45,000-55,000 per kW installed
+    installation_cost_per_kw = 50000
+    total_installation_cost = panel_capacity_kw * installation_cost_per_kw
+    payback_years = total_installation_cost / total_savings if total_savings > 0 else 99
+
+    # Best and worst months
+    best_month = max(monthly_results, key=lambda x: x['solar_generation_kwh']) if monthly_results else None
+    worst_month = min(monthly_results, key=lambda x: x['solar_generation_kwh']) if monthly_results else None
+
+    return jsonify({
+        'building': building_id,
+        'building_type': building_type,
+        'building_area_sqft': round(building_area, 0),
+        'panel_capacity_kw': round(panel_capacity_kw, 1),
+        'year': year,
+        'monthly': monthly_results,
+        'summary': {
+            'total_generation_kwh': round(total_generation, 0),
+            'total_consumption_kwh': round(total_consumption, 0),
+            'total_savings_rs': round(total_savings, 0),
+            'original_annual_bill': round(total_original_bill, 0),
+            'reduced_annual_bill': round(total_reduced_bill, 0),
+            'bill_reduction_pct': round((total_savings / total_original_bill * 100) if total_original_bill > 0 else 0, 1),
+            'annual_co2_saved_kg': round(annual_co2_saved, 0),
+            'annual_co2_saved_tons': round(annual_co2_saved / 1000, 1),
+            'installation_cost': round(total_installation_cost, 0),
+            'payback_years': round(payback_years, 1),
+            'overall_solar_offset_pct': round((total_generation / total_consumption * 100) if total_consumption > 0 else 0, 1),
+            'best_month': best_month['month'] if best_month else None,
+            'worst_month': worst_month['month'] if worst_month else None,
+            'trees_equivalent': round(annual_co2_saved / 21, 0)  # 1 tree absorbs ~21 kg CO2/year
         }
     })
 

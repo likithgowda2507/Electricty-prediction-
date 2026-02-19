@@ -26,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ---- NAV ----
 let forecastLoaded = false;
+let solarLoaded = false;
 function showSection(name) {
     document.querySelectorAll('[id^="section-"]').forEach(el => el.classList.add('hidden'));
     document.getElementById('section-' + name).classList.remove('hidden');
@@ -35,6 +36,7 @@ function showSection(name) {
     if (name === 'analysis' && historyData) loadBuildingData();
     if (name === 'trends') loadTrendsSection();
     if (name === 'prediction' && !forecastLoaded) { forecastLoaded = true; runYearlyForecast(); }
+    if (name === 'solar' && !solarLoaded) { solarLoaded = true; runSolarAnalysis(); }
 }
 
 // ===== OVERVIEW =====
@@ -148,10 +150,70 @@ function renderImpactCharts(d) {
 
 function renderFeatureChart(fi) {
     const c6 = document.getElementById('featureChart').getContext('2d'); dc('feat');
-    const paired = fi.features.map((f, i) => ({ name: f.replace(/_/g, ' '), val: fi.energy_importance[i] }));
-    paired.sort((a, b) => b.val - a.val);
-    const top = paired.slice(0, 12);
-    charts.feat = new Chart(c6, { type: 'bar', data: { labels: top.map(t => t.name), datasets: [{ label: 'Importance', data: top.map(t => t.val), backgroundColor: C.indigo, borderRadius: 6 }] }, options: { ...dOpts, indexAxis: 'y', plugins: { legend: { display: false } } } });
+
+    // Pair features with both energy and bill importance
+    const paired = fi.features.map((f, i) => ({
+        name: f.replace(/_/g, ' '),
+        energy: fi.energy_importance[i] || 0,
+        bill: fi.bill_importance ? (fi.bill_importance[i] || 0) : 0
+    }));
+
+    // Sort by energy importance and take top 12
+    paired.sort((a, b) => b.energy - a.energy);
+    const top = paired.slice(0, 12).reverse(); // reverse for horizontal chart (top item at top)
+
+    // Color gradient from amber to indigo
+    const barColors = top.map((_, i) => {
+        const ratio = i / (top.length - 1);
+        const r = Math.round(99 + (245 - 99) * (1 - ratio));
+        const g = Math.round(102 + (158 - 102) * (1 - ratio));
+        const b = Math.round(241 + (11 - 241) * (1 - ratio));
+        return `rgba(${r},${g},${b},0.85)`;
+    });
+
+    charts.feat = new Chart(c6, {
+        type: 'bar',
+        data: {
+            labels: top.map(t => t.name),
+            datasets: [
+                {
+                    label: 'Energy Model',
+                    data: top.map(t => +(t.energy * 100).toFixed(2)),
+                    backgroundColor: barColors,
+                    borderRadius: 6,
+                    barPercentage: 0.7
+                },
+                {
+                    label: 'Bill Model',
+                    data: top.map(t => +(t.bill * 100).toFixed(2)),
+                    backgroundColor: 'rgba(16,185,129,0.6)',
+                    borderRadius: 6,
+                    barPercentage: 0.7
+                }
+            ]
+        },
+        options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            layout: { padding: { left: 5, right: 15 } },
+            plugins: {
+                legend: { position: 'top', labels: { usePointStyle: true, font: { size: 11, family: 'Inter' }, padding: 14 } },
+                tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.raw.toFixed(2)}%` } }
+            },
+            scales: {
+                x: {
+                    grid: { color: '#f1f5f9' },
+                    ticks: { font: { size: 11 }, callback: v => v + '%' },
+                    title: { display: true, text: 'Importance (%)', font: { size: 11, weight: '500' }, color: '#64748b' }
+                },
+                y: {
+                    grid: { display: false },
+                    ticks: { font: { size: 11, weight: 500, family: 'Inter' }, color: '#334155' }
+                }
+            }
+        }
+    });
 }
 
 // ===== FORECAST (single-month, cached) =====
@@ -299,4 +361,152 @@ function renderBusinessInsight(d) {
     });
 
     document.getElementById('qa-result').classList.remove('hidden');
+}
+
+// ===== SOLAR ANALYSIS =====
+async function runSolarAnalysis() {
+    const building = document.getElementById('solar-building').value;
+    const capacity = parseFloat(document.getElementById('solar-capacity').value) || 0;
+
+    document.getElementById('solar-loading').classList.remove('hidden');
+    document.getElementById('solar-results').classList.add('hidden');
+
+    try {
+        const res = await fetch('/api/solar-analysis', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ building_id: building, year: 2026, panel_capacity_kw: capacity })
+        });
+        const d = await res.json();
+        if (!res.ok) { alert('Error: ' + d.error); return; }
+        document.getElementById('solar-loading').classList.add('hidden');
+        renderSolarResults(d);
+        renderSolarCharts(d);
+    } catch (err) {
+        document.getElementById('solar-loading').classList.add('hidden');
+        alert('Failed to load solar analysis.');
+        console.error(err);
+    }
+}
+
+function renderSolarResults(d) {
+    const s = d.summary;
+    const INR = v => '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+
+    // System info badges
+    document.getElementById('solar-sys-capacity').innerText = d.panel_capacity_kw;
+    document.getElementById('solar-sys-building').innerText = `${d.building} — ${d.building_type}`;
+    document.getElementById('solar-sys-area').innerText = Number(d.building_area_sqft).toLocaleString('en-IN');
+
+    // KPI cards
+    document.getElementById('solar-kpi-gen').innerText = `${Number(s.total_generation_kwh).toLocaleString('en-IN')} kWh`;
+    document.getElementById('solar-kpi-offset').innerText = `${s.overall_solar_offset_pct}% of consumption`;
+    document.getElementById('solar-kpi-save').innerText = INR(s.total_savings_rs);
+    document.getElementById('solar-kpi-billpct').innerText = `${s.bill_reduction_pct}% bill reduction`;
+    document.getElementById('solar-kpi-payback').innerText = `${s.payback_years} years`;
+    document.getElementById('solar-kpi-cost').innerText = `Installation: ${INR(s.installation_cost)}`;
+    document.getElementById('solar-kpi-co2').innerText = `${s.annual_co2_saved_tons} tons`;
+    document.getElementById('solar-kpi-trees').innerText = `≈ ${Number(s.trees_equivalent).toLocaleString('en-IN')} trees planted`;
+
+    // ROI card
+    document.getElementById('roi-cost').innerText = INR(s.installation_cost);
+    document.getElementById('roi-savings').innerText = INR(s.total_savings_rs);
+    document.getElementById('roi-payback').innerText = `${s.payback_years} yrs`;
+    const profit25yr = (s.total_savings_rs * 25) - s.installation_cost;
+    document.getElementById('roi-profit').innerText = INR(profit25yr);
+    document.getElementById('roi-best').innerText = s.best_month ? MN[s.best_month - 1] : '--';
+
+    // Monthly table
+    const tbody = document.getElementById('solar-table-body'); tbody.innerHTML = '';
+    let totals = { solar: 0, cons: 0, net: 0, oldBill: 0, newBill: 0, saved: 0, co2: 0 };
+    d.monthly.forEach(m => {
+        totals.solar += m.solar_generation_kwh;
+        totals.cons += m.avg_consumption_kwh;
+        totals.net += m.net_consumption_kwh;
+        totals.oldBill += m.avg_bill;
+        totals.newBill += m.reduced_bill;
+        totals.saved += m.total_savings;
+        totals.co2 += m.co2_saved_kg;
+        const offsetColor = m.solar_offset_pct > 80 ? 'text-emerald-600' : m.solar_offset_pct > 40 ? 'text-amber-600' : 'text-slate-500';
+        tbody.innerHTML += `<tr class="hover:bg-slate-50 transition">
+            <td class="px-4 py-3 font-semibold">${MN[m.month - 1]}</td>
+            <td class="px-4 py-3 text-right font-bold text-amber-600">${m.solar_generation_kwh.toLocaleString('en-IN')}</td>
+            <td class="px-4 py-3 text-right text-slate-600">${m.avg_consumption_kwh.toLocaleString('en-IN')}</td>
+            <td class="px-4 py-3 text-right text-slate-500">${m.net_consumption_kwh.toLocaleString('en-IN')}</td>
+            <td class="px-4 py-3 text-right font-semibold ${offsetColor}">${m.solar_offset_pct}%</td>
+            <td class="px-4 py-3 text-right text-slate-400">${INR(m.avg_bill)}</td>
+            <td class="px-4 py-3 text-right font-bold text-indigo-600">${INR(m.reduced_bill)}</td>
+            <td class="px-4 py-3 text-right font-bold text-emerald-600">${INR(m.total_savings)}</td>
+            <td class="px-4 py-3 text-right text-green-600">${m.co2_saved_kg.toLocaleString('en-IN')}</td>
+        </tr>`;
+    });
+    // Total row
+    tbody.innerHTML += `<tr class="bg-slate-100 font-bold">
+        <td class="px-4 py-3">TOTAL</td>
+        <td class="px-4 py-3 text-right text-amber-700">${Math.round(totals.solar).toLocaleString('en-IN')}</td>
+        <td class="px-4 py-3 text-right">${Math.round(totals.cons).toLocaleString('en-IN')}</td>
+        <td class="px-4 py-3 text-right">${Math.round(totals.net).toLocaleString('en-IN')}</td>
+        <td class="px-4 py-3 text-right text-emerald-700">${s.overall_solar_offset_pct}%</td>
+        <td class="px-4 py-3 text-right">${INR(totals.oldBill)}</td>
+        <td class="px-4 py-3 text-right text-indigo-700">${INR(totals.newBill)}</td>
+        <td class="px-4 py-3 text-right text-emerald-700">${INR(totals.saved)}</td>
+        <td class="px-4 py-3 text-right text-green-700">${Math.round(totals.co2).toLocaleString('en-IN')}</td>
+    </tr>`;
+
+    document.getElementById('solar-results').classList.remove('hidden');
+}
+
+function renderSolarCharts(d) {
+    const labels = d.monthly.map(m => MN[m.month - 1]);
+
+    // 1. Solar Generation vs Consumption
+    const c1 = document.getElementById('solarGenChart').getContext('2d'); dc('solarGen');
+    charts.solarGen = new Chart(c1, {
+        type: 'bar', data: {
+            labels,
+            datasets: [
+                { label: 'Solar Generation (kWh)', data: d.monthly.map(m => m.solar_generation_kwh), backgroundColor: '#f59e0b', borderRadius: 8, barPercentage: 0.45, categoryPercentage: 0.8 },
+                { label: 'Grid Consumption (kWh)', data: d.monthly.map(m => m.avg_consumption_kwh), backgroundColor: '#6366f1', borderRadius: 8, barPercentage: 0.45, categoryPercentage: 0.8 }
+            ]
+        }, options: { ...dOpts }
+    });
+
+    // 2. Bill Savings
+    const c2 = document.getElementById('solarSavingsChart').getContext('2d'); dc('solarSave');
+    charts.solarSave = new Chart(c2, {
+        type: 'bar', data: {
+            labels,
+            datasets: [
+                { label: 'Original Bill (₹)', data: d.monthly.map(m => m.avg_bill), backgroundColor: 'rgba(148,163,184,0.5)', borderRadius: 8 },
+                { label: 'Reduced Bill (₹)', data: d.monthly.map(m => m.reduced_bill), backgroundColor: '#10b981', borderRadius: 8 },
+                { label: 'Savings (₹)', data: d.monthly.map(m => m.total_savings), type: 'line', borderColor: '#f43f5e', borderWidth: 3, tension: 0.4, pointRadius: 5, pointBackgroundColor: '#f43f5e', fill: false, yAxisID: 'y1' }
+            ]
+        }, options: { ...dOpts, scales: { y: { grid: { color: '#f1f5f9' }, position: 'left' }, y1: { grid: { display: false }, position: 'right' }, x: { grid: { display: false } } } }
+    });
+
+    // 3. Solar Offset %
+    const c3 = document.getElementById('solarOffsetChart').getContext('2d'); dc('solarOff');
+    const offsets = d.monthly.map(m => m.solar_offset_pct);
+    const barColors = offsets.map(v => v > 80 ? '#10b981' : v > 50 ? '#f59e0b' : v > 30 ? '#3b82f6' : '#94a3b8');
+    charts.solarOff = new Chart(c3, {
+        type: 'bar', data: {
+            labels,
+            datasets: [{ label: 'Solar Offset %', data: offsets, backgroundColor: barColors, borderRadius: 10, barPercentage: 0.6 }]
+        }, options: {
+            ...dOpts, plugins: { legend: { display: false } },
+            scales: { y: { grid: { color: '#f1f5f9' }, max: 120, ticks: { callback: v => v + '%' } }, x: { grid: { display: false } } }
+        }
+    });
+
+    // 4. CO2 Saved
+    const c4 = document.getElementById('solarCO2Chart').getContext('2d'); dc('solarCO2');
+    charts.solarCO2 = new Chart(c4, {
+        type: 'line', data: {
+            labels,
+            datasets: [{
+                label: 'CO₂ Saved (kg)', data: d.monthly.map(m => m.co2_saved_kg),
+                borderColor: '#22c55e', backgroundColor: grad(c4, 'rgba(34,197,94,0.2)', 'rgba(34,197,94,0)'),
+                borderWidth: 3, tension: 0.4, fill: true, pointRadius: 5, pointBackgroundColor: '#fff', pointBorderColor: '#22c55e', pointBorderWidth: 2
+            }]
+        }, options: { ...dOpts, plugins: { legend: { display: false } } }
+    });
 }
