@@ -17,6 +17,19 @@ except ImportError as e:
     print(f"[WARN] Could not import from data_prep_unified: {e}")
     FEATURES = []
 
+# Also try to load from model_features.json to ensure consistency with trained model
+try:
+    import json
+    with open(os.path.join(MODEL_DIR, "model_features.json")) as f:
+        model_features_data = json.load(f)
+        if isinstance(model_features_data, dict):
+            FEATURES = model_features_data.get('features', FEATURES)
+        elif isinstance(model_features_data, list):
+            FEATURES = model_features_data
+    print(f"[OK] Loaded FEATURES from model_features.json: {len(FEATURES)} features")
+except Exception as e:
+    print(f"[WARN] Could not load from model_features.json: {e}")
+
 app = Flask(__name__, static_folder="../frontend/static", template_folder="../frontend")
 
 # Paths
@@ -136,6 +149,8 @@ def build_input_row(building_id, year, month, temp=None, humidity=None, rainfall
         return None
 
     row = {}
+    
+    # Build row for each feature
     for feat in FEATURES:
         if feat == 'Year':
             row[feat] = year
@@ -145,12 +160,12 @@ def build_input_row(building_id, year, month, temp=None, humidity=None, rainfall
             row[feat] = np.sin(2 * np.pi * month / 12)
         elif feat == 'Month_Cos':
             row[feat] = np.cos(2 * np.pi * month / 12)
-        elif feat == 'Temperature_Avg' and temp is not None:
-            row[feat] = temp
-        elif feat == 'Humidity' and humidity is not None:
-            row[feat] = humidity
-        elif feat == 'Rainfall_mm' and rainfall is not None:
-            row[feat] = rainfall
+        elif feat == 'Temperature_Avg':
+            row[feat] = temp if temp is not None else (float(baseline[feat].median()) if feat in baseline.columns and pd.notna(baseline[feat].median()) else 25)
+        elif feat == 'Humidity':
+            row[feat] = humidity if humidity is not None else (float(baseline[feat].median()) if feat in baseline.columns and pd.notna(baseline[feat].median()) else 60)
+        elif feat == 'Rainfall_mm':
+            row[feat] = rainfall if rainfall is not None else (float(baseline[feat].median()) if feat in baseline.columns and pd.notna(baseline[feat].median()) else 5)
         elif feat == 'Building_ID_Encoded':
             if building_encoder is not None and building_id in building_encoder.classes_:
                 row[feat] = int(building_encoder.transform([building_id])[0])
@@ -162,27 +177,14 @@ def build_input_row(building_id, year, month, temp=None, humidity=None, rainfall
                 val = baseline[feat].median()
                 row[feat] = float(val) if pd.notna(val) else 0
             else:
+                # Fill missing features with 0
                 row[feat] = 0
 
-    # ---- POST-PROCESS: Calculate temperature-based features ----
-    # These features help the model understand temperature → power usage relationship
-    if 'Temperature_Anomaly' in FEATURES:
-        temp_mean = df['Temperature_Avg'].mean()
-        row['Temperature_Anomaly'] = (row.get('Temperature_Avg', 30) - temp_mean)
+    # Create DataFrame with all features in correct order
+    input_df = pd.DataFrame([row])
     
-    if 'Temp_AC_Interaction' in FEATURES:
-        row['Temp_AC_Interaction'] = row.get('Temperature_Avg', 30) * row.get('AC_Usage_Hours', 0)
-    
-    if 'Temp_Peak_Load_Interaction' in FEATURES:
-        row['Temp_Peak_Load_Interaction'] = row.get('Temperature_Avg', 30) * row.get('Peak_Load_kW', 100)
-    
-    if 'Temp_Multiplier' in FEATURES:
-        # Higher temps (>30°C) increase consumption multiplier
-        temp_val = row.get('Temperature_Avg', 30)
-        multiplier = 1 + (temp_val - 30) / 10
-        row['Temp_Multiplier'] = max(0.8, multiplier)  # Min 0.8x for very cold
-
-    return pd.DataFrame([row])[FEATURES]
+    # Reorder columns to match FEATURES exactly
+    return input_df[FEATURES]
 
 
 # ============================================================
